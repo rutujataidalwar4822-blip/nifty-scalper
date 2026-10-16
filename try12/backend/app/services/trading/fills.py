@@ -50,7 +50,7 @@ def tick_age_seconds(tick: Optional[dict], now: datetime) -> Optional[float]:
         return None
     if t.tzinfo is None:
         t = t.replace(tzinfo=timezone.utc)
-    return max(0.0, (now - t).total_seconds())
+    return (now - t).total_seconds()
 
 
 def rr_ok(sl_pct: float, target_pct: float, min_rr: float) -> tuple[bool, Optional[float]]:
@@ -78,9 +78,9 @@ def quote_valid(bid, ask, age_s: Optional[float], params) -> bool:
         ask = float(ask or 0)
     except (TypeError, ValueError):
         return False
-    if bid <= 0 or ask <= 0 or ask < bid:
+    if not all(math.isfinite(v) for v in (bid, ask)) or bid <= 0 or ask <= 0 or ask < bid:
         return False
-    if age_s is None or age_s > params.stale_tick_seconds:
+    if age_s is None or not math.isfinite(age_s) or not 0 <= age_s <= params.stale_tick_seconds:
         return False
     mid = (bid + ask) / 2
     return (ask - bid) / mid * 100 <= params.quote_max_spread_pct + 1e-9

@@ -304,6 +304,11 @@ class TradingConfig(Base):
     stale_tick_seconds         = Column(Integer, nullable=False, default=60, server_default="60")
     entry_cutoff_buffer_min    = Column(Integer, nullable=False, default=10, server_default="10")
 
+    sizing_policy = Column(String(16), nullable=False, default="ONE_LOT", server_default="ONE_LOT")
+    planned_risk_pct = Column(Float, nullable=False, default=0.5, server_default="0.5")
+    aggregate_risk_pct = Column(Float, nullable=False, default=1.0, server_default="1.0")
+    stop_gap_buffer_pct = Column(Float, nullable=False, default=0.2, server_default="0.2")
+
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
 

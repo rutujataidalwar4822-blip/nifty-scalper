@@ -1,5 +1,6 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { estimatePositionPnl } from "@/lib/positionPnl";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import toast from "react-hot-toast";
 import { getPositions, closePosition, clearTestTrades } from "@/lib/tradingApi";
@@ -29,21 +30,24 @@ const failText = (e: unknown) => (e instanceof ApiError && e.detail ? e.detail :
 function LivePnl({ pos }: { pos: Position }) {
   useTickFeed(pos.token || null);
   const tick = useMarketStore(selectTick(pos.token));
-  const ltp = num(tick?.ltp);
-  const entry = num(pos.entry);
-  if (ltp === null || entry === null) {
-    return <span className="text-table text-text-2">awaiting tick</span>;
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, []);
+  const estimate = estimatePositionPnl(pos, tick, now);
+  if (!estimate) {
+    return <span className="text-table text-text-2">awaiting fresh tick</span>;
   }
-  // Long positions profit when the option rises; short positions profit when it falls.
-  // Use remaining_qty when available so a partial close is not counted twice.
-  const direction = pos.direction.toUpperCase();
-  const priceChange = direction === "SELL" ? entry - ltp : ltp - entry;
-  const remainingQty = num(pos.remaining_qty) ?? num(pos.qty) ?? 0;
-  const est = priceChange * remainingQty + (num(pos.gross_pnl) ?? 0);
   return (
     <span className="inline-flex flex-col items-end">
-      <DeltaText value={est} prefix="₹" decimals={0} />
-      <span className="font-mono text-micro text-text-2">LTP {ltp.toFixed(2)} · gross est.</span>
+      <DeltaText value={estimate.gross} prefix="₹" decimals={0} />
+      <span className="font-mono text-micro text-text-2">
+        {estimate.ltp === null ? "No remaining quantity" : `LTP ${estimate.ltp.toFixed(2)} · gross est.`}
+      </span>
+      <span className="font-mono text-micro text-text-2" title="Excludes estimated charges for the remaining exit">
+        After booked costs: ₹{estimate.bookedNet.toFixed(2)}
+      </span>
     </span>
   );
 }

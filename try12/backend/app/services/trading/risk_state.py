@@ -65,6 +65,45 @@ async def open_position_count(db, run_id: str) -> int:
     )).scalar_one() or 0)
 
 
+@dataclass(frozen=True)
+class AccountSnapshot:
+    equity: float
+    free_capital: float
+    open_exposure: float
+    exposure_cap: float
+    exposure_headroom: float
+    open_planned_risk: float
+    mtm_degraded: bool
+
+
+async def account_snapshot(db, run_id: str) -> AccountSnapshot:
+    from app.services.trading.accounting import open_pnl, planned_risk
+    cfg, p = ctx().cfg, params()
+    closed_net = float((await db.execute(select(func.coalesce(func.sum(PaperPosition.net_pnl), 0.0))
+        .where(PaperPosition.run_id == run_id, PaperPosition.is_open.is_(False)))).scalar_one())
+    rows = (await db.execute(select(PaperPosition).where(
+        PaperPosition.run_id == run_id, PaperPosition.is_open.is_(True)))).scalars().all()
+    exposure = await open_capital_used(db, run_id)
+    cash = cfg.capital + closed_net
+    equity = cash
+    risk, degraded = 0.0, False
+    for pos in rows:
+        mark, bad, _, _ = await _mark(pos)
+        values = open_pnl(pos, mark, p)
+        equity += values["estimated_net_pnl"]
+        cash += values["realized_gross_pnl"] - values["booked_costs"]
+        degraded = degraded or bad
+        # Reserve original stop risk even after trailing: never assume a
+        # guaranteed fill at a tightened stop, or silently free that risk.
+        stop = pos.initial_stop_loss or pos.stop_loss
+        risk += planned_risk(float(pos.actual_entry), float(stop),
+                             int(pos.quantity), int(pos.lot_size), p)["planned_risk"]
+    cap = min(cfg.capital, max(equity, 0.0)) * cfg.open_exposure_cap_pct / 100.0
+    return AccountSnapshot(round(equity, 2), round(max(cash - exposure, 0.0), 2),
+                           exposure, round(cap, 2), round(max(cap - exposure, 0.0), 2),
+                           round(risk, 2), degraded)
+
+
 # ── daily loss (realised + staleness-aware MTM, ratcheted) ───────────────────
 
 @dataclass(frozen=True)
@@ -110,14 +149,15 @@ async def _mark(pos) -> tuple[float, bool, Optional[str], Optional[float]]:
     except Exception as exc:
         logger.debug("MTM price read failed for pos %s: %s", pos.id, exc)
     age = fills.tick_age_seconds(tick, now_utc()) if tick else None
-    fresh = ltp is not None and ltp > 0 and age is not None and age <= p.stale_tick_seconds
+    from app.services.trading.accounting import valid_price
+    fresh = valid_price(ltp) and age is not None and 0 <= age <= p.stale_tick_seconds
     if fresh:
         bid, ask = (tick or {}).get("best_bid"), (tick or {}).get("best_ask")
         if fills.quote_valid(bid, ask, age, p):
             return float(bid), False, "BID", age
         return float(ltp), False, "LTP", age
     known = await _last_known_price(pos.id)
-    if known is not None:
+    if valid_price(known):
         return known, True, "LAST_KNOWN", age
     return float(pos.actual_entry or pos.entry_price or 0.0), True, "ENTRY", age
 
@@ -158,7 +198,7 @@ async def _engage(db, run_id: str, day: date, halt_type: str, *, scope: Optional
     await db.flush()
 
 
-async def daily_loss_figure(db) -> DailyLoss:
+async def daily_loss_figure(db, *, commit: bool = True) -> DailyLoss:
     """Realised (derived) + staleness-aware MTM, against the frozen RunConfig
     thresholds, with the per-day ratchet persisted in ``risk_halts``.
 
@@ -184,18 +224,14 @@ async def daily_loss_figure(db) -> DailyLoss:
     degradations = []
     for pos in open_rows:
         mark, is_degraded, source, age = await _mark(pos)
-        entry = float(pos.actual_entry or 0.0)
-        qty = int(pos.quantity or 0)
-        gross = (mark - entry) * qty
-        unrealised += gross - _exit_charges(mark, qty, int(pos.lots or 0))
-        if pos.partial_closed:                    # banked, but the position has not closed
-            unrealised += float(pos.partial_pnl or 0.0)
+        from app.services.trading.accounting import open_pnl
+        unrealised += open_pnl(pos, mark, params())["estimated_net_pnl"]
         if is_degraded:
             degraded.append(pos.id)
             degradations.append((pos, source, age))
     unrealised = round(unrealised, 2)
 
-    for pos, source, age in degradations:
+    for pos, source, age in (degradations if commit else []):
         await no_trade.record_degradation_once(
             run_id, no_trade.ReasonCode.MTM_DEGRADED, position_id=pos.id,
             underlying=pos.underlying,
@@ -220,7 +256,8 @@ async def daily_loss_figure(db) -> DailyLoss:
                       reason=f"daily loss {combined:.2f} breached ({breach_source})",
                       context=no_trade.as_context(realised=realised, unrealised=unrealised,
                                                   combined=combined, source=breach_source))
-        await db.commit()
+        if commit:
+            await db.commit()
         engaged_at = now_utc()
         logger.warning("DAILY_LOSS halt engaged for %s %s: combined %.2f (%s)",
                        run_id, day, combined, breach_source)
