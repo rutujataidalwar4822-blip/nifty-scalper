@@ -69,6 +69,10 @@ class TradingParams:
     max_trades_per_day: int = 6
     max_daily_loss: float = 6_000.0
     max_daily_loss_pct: float = 3.0
+    sizing_policy: str = "ONE_LOT"
+    planned_risk_pct: float = 0.5
+    aggregate_risk_pct: float = 1.0
+    stop_gap_buffer_pct: float = 0.2
 
     # ── halts (trading_config) ───────────────────────────────────────────────
     losing_streak_halt_n: int = 3
@@ -204,11 +208,21 @@ class TradingParams:
             if val < 0:
                 v.append(f"{key}={val} must be >= 0")
 
-        if self.partial_exit_enabled and self.max_lots_per_trade < 2:
-            v.append(
-                f"max_lots_per_trade={self.max_lots_per_trade} must be >= 2 "
-                f"when partial_exit_enabled"
-            )
+        import math
+        if self.sizing_policy not in ("ONE_LOT", "BUDGET"):
+            v.append("sizing_policy must be ONE_LOT or BUDGET")
+        for key in ("planned_risk_pct", "aggregate_risk_pct"):
+            value = getattr(self, key)
+            if not math.isfinite(value) or not 0 < value <= 100:
+                v.append(f"{key} must be finite and in (0, 100]")
+        if not math.isfinite(self.stop_gap_buffer_pct) or not 0 <= self.stop_gap_buffer_pct <= 100:
+            v.append("stop_gap_buffer_pct must be finite and in [0, 100]")
+        for key in ("max_lots_per_trade", "max_open_positions", "max_trades_per_day"):
+            value = getattr(self, key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                v.append(f"{key} must be a positive integer")
+        if not 0 < self.open_exposure_cap_pct <= 100:
+            v.append("open_exposure_cap_pct must be in (0, 100]")
 
         c = self.transition_cooldown_candles
         if not (1 <= c <= TRANSITION_COOLDOWN_CANDLES_MAX):

@@ -93,6 +93,11 @@ class SizingDecision:
     trade_amount: float
     lots: int
     capital_used: float
+    planned_risk: float = 0.0
+    risk_limit: float = 0.0
+    stop_risk: float = 0.0
+    estimated_costs: float = 0.0
+    gap_buffer: float = 0.0
     clamps: list = field(default_factory=list)
     binding_clamp: Optional[str] = None
     reject: Optional[ReasonCode] = None
@@ -200,6 +205,12 @@ async def fraction_decision(db, strategy: str) -> FractionDecision:
     return decision
 
 
+def effective_budget(base_amount: float, regime_multiplier: float) -> float:
+    if not all(math.isfinite(v) and v >= 0 for v in (base_amount, regime_multiplier)):
+        raise ValueError("budget and regime multiplier must be finite and non-negative")
+    return round_to_500(base_amount * regime_multiplier)
+
+
 def sizing_decision(*, fraction: FractionDecision, regime_multiplier: float,
                     expected_entry_fill: float, lot_size: int, available_capital: float,
                     open_exposure: float) -> SizingDecision:
@@ -207,7 +218,7 @@ def sizing_decision(*, fraction: FractionDecision, regime_multiplier: float,
     applied here exactly once, to the deployed amount."""
     cfg = ctx().cfg
     clamps = list(fraction.clamps)
-    trade_amount = round_to_500(fraction.base_amount * regime_multiplier)
+    trade_amount = effective_budget(fraction.base_amount, regime_multiplier)
     if regime_multiplier != 1.0:
         clamps.append("regime_multiplier")
     cost_per_lot = expected_entry_fill * lot_size
@@ -221,6 +232,8 @@ def sizing_decision(*, fraction: FractionDecision, regime_multiplier: float,
             binding = name
             clamps.append(name)
 
+    if params().sizing_policy == "ONE_LOT":
+        _clamp(1, "ONE_LOT")
     _clamp(cfg.max_lots_per_trade, "max_lots_per_trade")
     if cost_per_lot > 0:
         _clamp(int(max(available_capital, 0.0) // cost_per_lot), "available_capital")
@@ -232,7 +245,9 @@ def sizing_decision(*, fraction: FractionDecision, regime_multiplier: float,
     if lots < 1:
         if cost_per_lot > trade_amount:
             reject = ReasonCode.LOT_UNAFFORDABLE
-        elif binding in ("available_capital", "open_exposure_cap"):
+        elif binding == "open_exposure_cap":
+            reject = ReasonCode.EXPOSURE_CAP
+        elif binding == "available_capital":
             reject = ReasonCode.INSUFFICIENT_CAPITAL
         else:
             reject = ReasonCode.SIZED_TO_ZERO
@@ -378,29 +393,44 @@ async def evaluate_sizing(db, signal, candidate, *, fraction: FractionDecision,
     p_ = params()
     rc = ctx()
     try:
-        used = await risk_state.open_capital_used(db, rc.run_id)
+        account = await risk_state.account_snapshot(db, rc.run_id)
+        used = account.open_exposure
     except Exception as exc:                     # fail closed
         logger.error("[RiskGate] sizing could not read capital in use: %s", exc, exc_info=True)
         return _no(Stage.SIZING, ReasonCode.SIZED_TO_ZERO, "capital in use unreadable",
                    error=f"{type(exc).__name__}: {exc}")
 
+    from app.services.trading.accounting import planned_risk, valid_price
+    if (not valid_price(candidate.ltp) or not isinstance(candidate.lot_size, int)
+            or isinstance(candidate.lot_size, bool) or candidate.lot_size <= 0
+            or getattr(candidate, "tick_size", fills.TICK) != fills.TICK):
+        return _no(Stage.SIZING, ReasonCode.INVALID_CONTRACT,
+                   "Invalid entry, lot size, or unsupported instrument tick size")
     age = getattr(candidate, "tick_age_s", None)
+    if age is not None and (not math.isfinite(age) or not 0 <= age <= p_.stale_tick_seconds):
+        return _no(Stage.SIZING, ReasonCode.QUOTE_STALE, "Selected quote is not fresh")
     fill, fill_source = fills.entry_fill(
         candidate.ltp, getattr(candidate, "bid", 0), getattr(candidate, "ask", 0), age, p_)
 
     # initial risk must be positive (R6.5), checked before any capital is touched
+    if not all(math.isfinite(v) for v in (fill, signal.sl_pct, signal.target_pct)):
+        return _no(Stage.SIZING, ReasonCode.INVALID_CONTRACT, "Non-finite entry or stop parameters")
     sl, tgt, rr, stretched = fills.entry_levels(fill, signal.sl_pct, signal.target_pct, p_.min_rr)
     initial_risk = round(fill - sl, 2)
-    if signal.sl_pct <= 0 or initial_risk <= 0:
+    if not 0 < signal.sl_pct < 1 or not 0 < sl < fill or initial_risk <= 0:
         return _no(Stage.SIZING, ReasonCode.INITIAL_RISK_NON_POSITIVE,
                    f"Initial risk {initial_risk:.2f} is not positive "
                    f"(actual_entry={fill} sl={sl})", actual_entry=fill, sl=sl)
 
     sizing = sizing_decision(
         fraction=fraction, regime_multiplier=regime_multiplier, expected_entry_fill=fill,
-        lot_size=candidate.lot_size, available_capital=rc.cfg.capital - used,
+        lot_size=candidate.lot_size, available_capital=account.free_capital,
         open_exposure=used)
-    ctx_dict = dict(open_capital_used=used, binding_clamp=sizing.binding_clamp,
+    ctx_dict = dict(symbol=getattr(candidate, "symbol", ""),
+                    free_capital=account.free_capital, equity=account.equity,
+                    exposure_cap=account.exposure_cap, exposure_headroom=account.exposure_headroom,
+                    available_margin=None, open_planned_risk=account.open_planned_risk,
+                    open_capital_used=used, binding_clamp=sizing.binding_clamp,
                     trade_amount=sizing.trade_amount, lots=sizing.lots,
                     expected_entry_fill=fill, fill_source=fill_source,
                     cost_per_lot=round(fill * candidate.lot_size, 2))
@@ -410,12 +440,35 @@ async def evaluate_sizing(db, signal, candidate, *, fraction: FractionDecision,
             allowed=False, stage=Stage.SIZING, code=sizing.reject,
             reason=(f"{sizing.reject.value}: 1 lot {getattr(candidate, 'symbol', '')} = "
                     f"₹{cost:.0f} ({fill:.2f} × {candidate.lot_size}); budget "
-                    f"₹{sizing.trade_amount:.0f}, free ₹{rc.cfg.capital - used:.0f}"),
+                    f"₹{sizing.trade_amount:.0f}, free ₹{account.free_capital:.2f}, "
+                    f"exposure headroom ₹{account.exposure_headroom:.2f}; "
+                    f"failed {sizing.binding_clamp or 'premium_budget'}"),
             context=no_trade.as_context(**ctx_dict), sizing=sizing,
             regime_multiplier=regime_multiplier, fraction=fraction)
 
-    # costs must not eat more than max_cost_fraction_of_edge of the gross edge at target
     qty = sizing.lots * candidate.lot_size
+    risk = planned_risk(fill, sl, qty, candidate.lot_size, p_)
+    limit = max(account.equity, 0.0) * p_.planned_risk_pct / 100.0
+    sizing = dataclasses.replace(sizing, risk_limit=limit, **risk)
+    ctx_dict.update(risk, risk_limit=limit)
+    failed = []
+    if sizing.capital_used > account.exposure_headroom + 1e-9:
+        failed.append(ReasonCode.EXPOSURE_CAP)
+    if risk["planned_risk"] > limit + 1e-9:
+        failed.append(ReasonCode.PLANNED_RISK_CAP)
+    if account.open_planned_risk + risk["planned_risk"] > max(account.equity, 0.0) * p_.aggregate_risk_pct / 100.0 + 1e-9:
+        failed.append(ReasonCode.AGGREGATE_RISK_CAP)
+    if account.mtm_degraded:
+        failed.append(ReasonCode.MTM_DEGRADED)
+    ctx_dict["failed_checks"] = [code.value for code in failed]
+    logger.info("SIZING_DECISION %s", ctx_dict)
+    if failed:
+        return GateDecision(False, Stage.SIZING, failed[0],
+                            f"{failed[0].value}: planned risk ₹{risk['planned_risk']:.2f}, "
+                            f"limit ₹{limit:.2f}; one lot is never forced above a limit",
+                            context=no_trade.as_context(**ctx_dict), sizing=sizing)
+
+    # costs must not eat more than max_cost_fraction_of_edge of the gross edge at target
     cost = fills.expected_round_trip_cost(fill, qty, sizing.lots, p_)
     edge = (tgt - fill) * qty
     if edge <= 0 or cost > p_.max_cost_fraction_of_edge * edge:
@@ -447,6 +500,8 @@ async def enter(db, *, run_id: str, trading_day: date, capital_used: float,
                 advisory_used: float, insert: Callable[[Any], Awaitable[Any]],
                 duplicate_token: Optional[str] = None,
                 duplicate_symbol: Optional[str] = None,
+                underlying: Optional[str] = None,
+                planned_risk_amount: Optional[float] = None,
                 lock_timeout_s: float = LOCK_TIMEOUT_S) -> GateDecision:
     """One transaction: lock → 13a (derived count) → 13b (derived capital) →
     insert → commit. Every early return happens before the insert, with nothing
@@ -478,11 +533,14 @@ async def enter(db, *, run_id: str, trading_day: date, capital_used: float,
             PaperPosition.run_id == run_id,
             PaperPosition.is_open.is_(True),
         )
-        if duplicate_token is not None:
+        if underlying:
+            duplicate_query = duplicate_query.where(PaperPosition.underlying == underlying)
+        elif duplicate_token is not None:
             duplicate_query = duplicate_query.where(PaperPosition.token == duplicate_token)
         elif duplicate_symbol:
             duplicate_query = duplicate_query.where(PaperPosition.symbol == duplicate_symbol)
-        duplicate_exists = (await db.execute(duplicate_query.limit(1))).scalar_one_or_none()
+        duplicate_exists = ((await db.execute(duplicate_query.limit(1))).scalar_one_or_none()
+                            if underlying or duplicate_token or duplicate_symbol else None)
         if duplicate_exists is not None:
             await db.rollback()
             return _no(
@@ -506,6 +564,48 @@ async def enter(db, *, run_id: str, trading_day: date, capital_used: float,
                        f"₹{cfg.capital:.0f}",
                        advisory_used=advisory_used, locked_used=locked_used,
                        amount=capital_used, capital=cfg.capital)
+        open_count = await risk_state.open_position_count(db, run_id)
+        if open_count >= cfg.max_open_positions:
+            await db.rollback()
+            return _no(Stage.ENTRY, ReasonCode.MAX_OPEN_POSITIONS, "Open-position cap reached under lock")
+        if locked_used + capital_used > cfg.capital * cfg.open_exposure_cap_pct / 100.0 + 1e-9:
+            await db.rollback()
+            return _no(Stage.ENTRY, ReasonCode.EXPOSURE_CAP, "Exposure cap reached under lock",
+                       open_exposure=locked_used, required_premium=capital_used,
+                       exposure_cap=cfg.capital * cfg.open_exposure_cap_pct / 100.0)
+        if planned_risk_amount is not None:
+            from app.services.trading.mode_manager import mode_manager
+            halted, why = await mode_manager.kill_switch_state()
+            if halted:
+                await db.rollback()
+                return _no(Stage.ENTRY, ReasonCode.KILL_SWITCH, why)
+            loss = await risk_state.daily_loss_figure(db, commit=False)
+            if loss.breached:
+                await db.commit()  # preserve the ratchet; no entry was inserted
+                return _no(Stage.ENTRY, ReasonCode.DAILY_LOSS_CAP, "Daily loss breached under lock")
+            streak = await risk_state.streak_state(db, run_id, trading_day)
+            if streak.global_halt or (streak.cooldown_until and ctx().clock.now_utc() < streak.cooldown_until):
+                await db.rollback()
+                return _no(Stage.ENTRY, ReasonCode.POST_LOSS_COOLDOWN, "Loss halt/cooldown changed during selection")
+            account = await risk_state.account_snapshot(db, run_id)
+            p = params()
+            code = None
+            if not math.isfinite(planned_risk_amount) or planned_risk_amount <= 0:
+                code = ReasonCode.INVALID_CONTRACT
+            elif account.mtm_degraded:
+                code = ReasonCode.MTM_DEGRADED
+            elif capital_used > account.free_capital:
+                code = ReasonCode.INSUFFICIENT_CAPITAL
+            elif capital_used > account.exposure_headroom:
+                code = ReasonCode.EXPOSURE_CAP
+            elif planned_risk_amount > max(account.equity, 0) * p.planned_risk_pct / 100:
+                code = ReasonCode.PLANNED_RISK_CAP
+            elif account.open_planned_risk + planned_risk_amount > max(account.equity, 0) * p.aggregate_risk_pct / 100:
+                code = ReasonCode.AGGREGATE_RISK_CAP
+            if code:
+                await db.rollback()
+                return _no(Stage.ENTRY, code, f"{code.value}: locked risk approval failed",
+                           **dataclasses.asdict(account), planned_risk=planned_risk_amount)
         result = await insert(db)
         await db.commit()                         # releases the advisory lock
         return GateDecision(allowed=True, stage=Stage.ENTRY, code=None, reason="", result=result)

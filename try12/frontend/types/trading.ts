@@ -33,7 +33,14 @@ export interface Position {
   direction:    string;
   lots:         number;
   lot_size?:    number;
+  /** Open remainder; on legacy closed rows this is the final exit leg. */
   qty:          number;
+  original_qty?: number;
+  realized_gross_pnl?: number;
+  brokerage?: number;
+  planned_risk?: number | null;
+  realized_loss?: number | null;
+  quote_max_age_seconds?: number;
   entry:        number;
   sl?:          number;
   target?:      number;

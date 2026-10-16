@@ -179,9 +179,8 @@ def _hard_filter(
         return _reject(ReasonCode.QUOTE_UNAVAILABLE,
                        f"no usable bid/ask (bid={bid} ask={ask}) — entries fill off the "
                        f"ask, so a quote-less contract is refused")
-    if (has_quote or tick_age_s is not None) and \
-            (tick_age_s is None or not math.isfinite(tick_age_s)
-             or tick_age_s < 0 or tick_age_s > tp.stale_tick_seconds):
+    if (tick_age_s is None or not math.isfinite(tick_age_s)
+            or tick_age_s < 0 or tick_age_s > tp.stale_tick_seconds):
         age = "unknown" if tick_age_s is None else f"{tick_age_s:.0f}s"
         return _reject(ReasonCode.QUOTE_STALE,
                        f"quote age {age} > {tp.stale_tick_seconds}s")
@@ -612,6 +611,10 @@ def score_candidate(
     rejected the contract; the FilterResult names the ReasonCode.
     """
     tp = tp or params()
+    if (not isinstance(inst.lot_size, int) or isinstance(inst.lot_size, bool)
+            or inst.lot_size <= 0 or getattr(inst, "tick_size", fills.TICK) != fills.TICK):
+        return None, _reject(ReasonCode.INVALID_CONTRACT,
+                             "Master lot size invalid or tick size unsupported")
     ltp    = float(tick.get("ltp")       or 0)
     _bid   = tick.get("best_bid")
     _ask   = tick.get("best_ask")
@@ -644,6 +647,11 @@ def score_candidate(
             hf.filter, hf.reason,
         )
         return None, hf
+
+    entry, _ = fills.entry_fill(ltp, bid, ask, age, tp)
+    if max_premium is not None and entry > max_premium + 1e-9:
+        return None, _reject(ReasonCode.PREMIUM_ABOVE_AFFORDABLE,
+                             f"Executable fill {entry:.2f} exceeds ceiling {max_premium:.2f}")
 
     # ── STEP 2: Soft scoring ──────────────────────────────────────────────────
     iv_decimal = (iv or 20.0) / 100.0
@@ -934,9 +942,13 @@ class OptionSelector:
         high = atm + 5 * step
         instruments = sorted(
             (i for i in universe
-             if i.expiry == expiry and i.strike is not None and low <= i.strike <= high),
+             if _expiry_date(i.expiry) == expiry and i.strike is not None and low <= i.strike <= high),
             key=lambda i: i.strike,
         )
+        logger.info("OPTION_UNIVERSE underlying=%s side=%s contracts=%d expiry=%s "
+                    "expiry_survivors=%d strike_survivors=%d",
+                    underlying, option_type_enum.value, len(universe), expiry,
+                    sum(_expiry_date(i.expiry) == expiry for i in universe), len(instruments))
         if not instruments:
             _tally(rejections, ReasonCode.NO_INSTRUMENTS.value)
             return [], rejections, choice
@@ -970,8 +982,21 @@ class OptionSelector:
 
         for inst in instruments:
             tick = await market().get_tick(inst.token)
-            if not tick or not float(tick.get("ltp") or 0) > 0:
+            try:
+                if not isinstance(tick, dict):
+                    raise ValueError("tick is not an object")
+                for key in ("ltp", "best_bid", "best_ask", "oi", "volume", "iv", "open"):
+                    value = tick.get(key)
+                    if value is not None and not math.isfinite(float(value)):
+                        raise ValueError(f"non-finite {key}")
+                if float(tick.get("ltp") or 0) <= 0:
+                    raise ValueError("non-positive LTP")
+                for key in ("oi", "volume"):
+                    if tick.get(key) is not None and float(tick[key]) != int(tick[key]):
+                        raise ValueError(f"non-integer {key}")
+            except (TypeError, ValueError, OverflowError) as exc:
                 _tally(rejections, ReasonCode.TICK_UNAVAILABLE.value)
+                logger.info("CANDIDATE_REJECT token=%s reason=%s", inst.token, exc)
                 continue
             ticks[inst.token] = tick
 
@@ -982,7 +1007,8 @@ class OptionSelector:
 
             # affordable_max_premium: the regime multiplier is applied ONCE, here
             lot = inst.lot_size or 0
-            max_premium = (base_amount * regime_multiplier) / lot if lot > 0 else 0.0
+            from app.services.trading.risk_gate import effective_budget
+            max_premium = effective_budget(base_amount, regime_multiplier) / lot if lot > 0 else 0.0
 
             cand, hf = score_candidate(
                 inst        = inst,
@@ -1001,6 +1027,8 @@ class OptionSelector:
             )
             if cand is None:
                 _tally(rejections, hf.filter)
+                logger.info("CANDIDATE_REJECT symbol=%s lot_size=%s budget=%.2f code=%s reason=%s",
+                            inst.symbol, lot, effective_budget(base_amount, regime_multiplier), hf.filter, hf.reason)
             elif cand.score < tp.min_score:
                 _tally(rejections, ReasonCode.SCORE_BELOW_MIN.value)
                 logger.debug("[SoftFilter] REJECTED %s %.0f%s score=%.1f < %.1f",

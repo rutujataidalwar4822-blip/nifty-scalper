@@ -62,6 +62,7 @@ from app.services.trading.option_selector import option_selector
 from app.strategies.base import Direction
 from app.strategies.names import ALL_STRATEGY_NAMES
 from app.core.config import settings
+from app.runtime.context import params as runtime_params
 
 router = APIRouter(prefix="/trading", tags=["trading"])
 logger = logging.getLogger(__name__)
@@ -81,6 +82,10 @@ class ConfigUpdate(BaseModel):
     trade_amount:         Optional[float]   = None   # ₹ per trade
     max_trades_per_day:   Optional[int]     = None
     study_phase:          Optional[bool]    = None   # flip to False to start paper trading
+    sizing_policy:        Optional[str] = None
+    planned_risk_pct:     Optional[float] = None
+    aggregate_risk_pct:   Optional[float] = None
+    stop_gap_buffer_pct:  Optional[float] = None
 
 class StrategyFlagUpdate(BaseModel):
     strategy_name: str
@@ -752,6 +757,12 @@ async def get_positions(
             "exit_reason":      r.exit_reason,
             "capital_used":     r.trade_amount_used,
             "gross_pnl":    r.gross_pnl,
+            "realized_gross_pnl": float(r.gross_pnl or 0.0),
+            "original_qty": r.original_quantity or (r.quantity + (r.partial_exit_qty or 0)),
+            "brokerage": r.brokerage,
+            "planned_risk": (r.sizing_detail or {}).get("planned_risk"),
+            "realized_loss": max(0.0, -float(r.net_pnl or 0.0)) if not r.is_open else None,
+            "quote_max_age_seconds": runtime_params().stale_tick_seconds,
             "charges":      r.statutory_charges,
             "net_pnl":      r.net_pnl,
             "is_open":      r.is_open,
@@ -760,7 +771,7 @@ async def get_positions(
             "partial_exit_price": r.partial_exit_price,
             "partial_exit_qty":   r.partial_exit_qty,
             "partial_pnl":        r.partial_pnl,
-            "remaining_qty":      r.remaining_quantity,
+            "remaining_qty":      r.quantity if r.is_open else 0,
             "entry_time":   r.entry_time.isoformat() if r.entry_time else None,
             "exit_time":    r.exit_time.isoformat() if r.exit_time else None,
         }
@@ -972,7 +983,8 @@ async def clear_test_trades(body: Optional[ClearTestTrades] = None,
 @router.get("/pnl")
 async def get_pnl_today(run_id: str = Depends(run_id_query),
                         db: AsyncSession = Depends(get_db)):
-    today = date.today()
+    from app.runtime.context import trading_day
+    today = trading_day()
     result = await db.execute(
         select(DailyPnLSummary).where(DailyPnLSummary.run_id == run_id,
                                       DailyPnLSummary.date == today)
@@ -1009,7 +1021,8 @@ async def get_pnl_history(
     run_id: str = Depends(run_id_query),
     db: AsyncSession = Depends(get_db),
 ):
-    since = date.today() - timedelta(days=days)
+    from app.runtime.context import trading_day
+    since = trading_day() - timedelta(days=days)
     result = await db.execute(
         select(DailyPnLSummary)
         .where(DailyPnLSummary.run_id == run_id, DailyPnLSummary.date >= since)
@@ -1165,7 +1178,8 @@ async def get_daily_snapshots(
     days:       int = Query(30, ge=1, le=90),
     db: AsyncSession = Depends(get_db),
 ):
-    since = date.today() - timedelta(days=days)
+    from app.runtime.context import trading_day
+    since = trading_day() - timedelta(days=days)
     result = await db.execute(
         select(MarketDailySnapshot)
         .where(
@@ -1204,7 +1218,8 @@ async def get_daily_snapshots(
 
 @router.get("/market-study/vix")
 async def get_vix_history(days: int = Query(30), db: AsyncSession = Depends(get_db)):
-    since = date.today() - timedelta(days=days)
+    from app.runtime.context import trading_day
+    since = trading_day() - timedelta(days=days)
     result = await db.execute(
         select(VIXData).where(VIXData.date >= since).order_by(VIXData.date)
     )

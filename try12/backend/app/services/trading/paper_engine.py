@@ -382,6 +382,8 @@ class PaperEngine:
             pos.signal_id = sig_id
             db.add(pos)
             await db.flush()
+            await db.execute(update(StrategySignal).where(StrategySignal.id == sig_id)
+                             .values(status=SignalStatus.ENTERED, trade_id=pos.id))
             return pos.id
 
         try:
@@ -392,6 +394,8 @@ class PaperEngine:
                     advisory_used=float(sized.context.get("open_capital_used", 0.0)),
                     duplicate_token=selected.token,
                     duplicate_symbol=selected.symbol,
+                    underlying=signal.underlying,
+                    planned_risk_amount=sizing.planned_risk,
                     insert=_insert)
         except Exception as exc:
             # The transaction rolled back: no row exists and nothing is held.
@@ -583,7 +587,8 @@ class PaperEngine:
             ltp = await market().get_ltp(pos.token)
         except Exception as exc:
             logger.debug("get_ltp failed for pos %d: %s", pos.id, exc)
-        if ltp:
+        from app.services.trading.accounting import valid_price
+        if valid_price(ltp):
             tick = None
             try:
                 tick = await market().get_tick(pos.token)
@@ -593,7 +598,7 @@ class PaperEngine:
             # An LTP without a verifiable timestamp is not fresh. Treat it as
             # stale so it cannot trigger target, trailing, partial, or timeout
             # logic as though it were a current market quote.
-            return float(ltp), (age is None or age > params().stale_tick_seconds)
+            return float(ltp), (age is None or not 0 <= age <= params().stale_tick_seconds)
 
         known = self._last_known.get(pos.id)
         if known:
@@ -671,7 +676,10 @@ class PaperEngine:
         age = _tick_age_seconds(tick)
         # A price without a timestamp cannot be proven fresh. Treat it as stale
         # so targets, trailing, partials, and timeouts never act on an unknown-age quote.
-        stale = not ltp or age is None or age > p.stale_tick_seconds
+        from app.services.trading.accounting import valid_price
+        if not valid_price(ltp):
+            ltp = None
+        stale = ltp is None or age is None or not 0 <= age <= p.stale_tick_seconds
         in_session = is_market_hours(now_ist)
 
         if not ltp:
@@ -764,7 +772,8 @@ class PaperEngine:
                 async with sessions()() as db:
                     await db.execute(
                         update(PaperPosition)
-                        .where(PaperPosition.id == pos.id)
+                        .where(PaperPosition.id == pos.id, PaperPosition.run_id == ctx().run_id,
+                               PaperPosition.is_open.is_(True), PaperPosition.stop_loss < new_sl)
                         .values(stop_loss=new_sl, trailing_sl=new_sl)
                     )
                     db.add(PositionEvent(
@@ -875,7 +884,9 @@ class PaperEngine:
         async with sessions()() as db:
             upd = await db.execute(
                 update(PaperPosition)
-                .where(PaperPosition.id == pos.id, PaperPosition.partial_closed == False)  # noqa: E712
+                .where(PaperPosition.id == pos.id, PaperPosition.run_id == ctx().run_id,
+                       PaperPosition.is_open.is_(True), PaperPosition.partial_closed.is_(False),
+                       PaperPosition.quantity == pos.quantity)
                 .values(
                     partial_closed      = True,
                     partial_exit_price  = fill,
@@ -885,7 +896,10 @@ class PaperEngine:
                     quantity            = remain_qty,
                     lots                = pos.lots - partial_lots,
                     gross_pnl           = round((pos.gross_pnl or 0) + partial_gross, 2),
-                    net_pnl             = round((pos.net_pnl or 0) + partial_net, 2),
+                    net_pnl             = fills.net_pnl(
+                        (pos.gross_pnl or 0) + partial_gross,
+                        (pos.brokerage or 0) + partial_brok,
+                        (pos.statutory_charges or 0) + partial_chg),
                     brokerage           = round((pos.brokerage or 0) + partial_brok, 2),
                     statutory_charges   = round((pos.statutory_charges or 0) + partial_chg, 2),
                     trade_amount_used   = round((pos.trade_amount_used or 0) - capital_released, 2),
@@ -926,7 +940,7 @@ class PaperEngine:
 
     # ── Full close ────────────────────────────────────────────────────────────
 
-    async def _close_position(self, pos_id: int, exit_price: float, reason: str):
+    async def _close_position(self, pos_id: int, exit_price: float, reason: str, _retry: int = 0):
         """Final close. *exit_price* is the trigger (stop, target, or the price
         the caller observed); the fill comes from fills.exit_fill with the tick
         read here, so the observed LTP drives the gap-through rule and a
@@ -934,7 +948,8 @@ class PaperEngine:
         p = params()
         async with sessions()() as db:
             result = await db.execute(
-                select(PaperPosition).where(PaperPosition.id == pos_id)
+                select(PaperPosition).where(PaperPosition.id == pos_id,
+                                            PaperPosition.run_id == ctx().run_id)
             )
             pos = result.scalar_one_or_none()
             if not pos or not pos.is_open:
@@ -1015,15 +1030,20 @@ class PaperEngine:
                 hold_minutes        = hold_minutes,
             )
             close_stmt = (update(PaperPosition)
-                          .where(PaperPosition.id == pos_id, PaperPosition.is_open == True)  # noqa: E712
+                          .where(PaperPosition.id == pos_id, PaperPosition.run_id == ctx().run_id,
+                                 PaperPosition.is_open.is_(True), PaperPosition.quantity == close_qty,
+                                 PaperPosition.partial_closed == pos.partial_closed)
                           .values(**close_values))
             # Conditional on is_open so two concurrent closers (monitor loop,
             # EOD, kill switch) can never double-release capital.
             upd = await db.execute(close_stmt)
             if upd.rowcount != 1:
                 await db.rollback()
-                logger.info("[PaperEngine] pos %d already closed by another task — skipping", pos_id)
-                return
+                if _retry < 2:
+                    return await self._close_position(pos_id, exit_price, reason, _retry + 1)
+                from app.services.trading.mode_manager import mode_manager
+                await mode_manager.set_trading_halted(True, f"Exit contention for position {pos_id}")
+                raise RuntimeError(f"Exit reconciliation required for position {pos_id}")
 
             # One transaction: the close and its statistics (design §7). The
             # final values are stamped on *pos* so the outcome reads them.
@@ -1061,8 +1081,11 @@ class PaperEngine:
                                             regime=pos.entry_regime),
             )
             if upd.rowcount != 1:
-                logger.info("[PaperEngine] pos %d already closed by another task — skipping", pos_id)
-                return
+                if _retry < 2:
+                    return await self._close_position(pos_id, exit_price, reason, _retry + 1)
+                from app.services.trading.mode_manager import mode_manager
+                await mode_manager.set_trading_halted(True, f"Exit contention for position {pos_id}")
+                raise RuntimeError(f"Exit reconciliation required for position {pos_id}")
 
         logger.info(
             "[PaperEngine] 🔒 CLOSED pos %d | %s | exit=%.2f (%s) PnL=₹%.2f R=%s",
@@ -1255,7 +1278,8 @@ class PaperEngine:
     async def manual_close(self, pos_id: int) -> bool:
         async with sessions()() as db:
             result = await db.execute(
-                select(PaperPosition).where(PaperPosition.id == pos_id)
+                select(PaperPosition).where(PaperPosition.id == pos_id,
+                                            PaperPosition.run_id == ctx().run_id)
             )
             pos = result.scalar_one_or_none()
             if not pos or not pos.is_open:
